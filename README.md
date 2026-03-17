@@ -31,7 +31,7 @@ Features:
 - Turn panel to **side A, B, or C**
 - Control (TL) **lighting on / off**
 - Read current **status** (side, lighting, errors)
-- **Scan** all 64 RS-485 node addresses in parallel
+- **Scan** all 64 RS-485 node addresses sequentially over a single connection
 - **Error detection** and reporting
 - **Automated test suite** with timing and pass/fail reporting
 - YAML **configuration file** with CLI overrides
@@ -47,7 +47,7 @@ rotapanel-testing-tool/
 │   ├── protocol.py        # RS-485 / RP-2000 frame building & parsing
 │   ├── connection.py      # TCP connection management
 │   ├── device.py          # High-level device control (turn, light, status)
-│   ├── scanner.py         # Parallel device scanner
+│   ├── scanner.py         # Sequential device scanner
 │   └── tests.py           # Automated test sequences & reporting
 ├── cli.py                 # Command-line interface
 ├── config.yaml            # Example configuration file
@@ -112,10 +112,13 @@ python cli.py scan --host 192.168.1.100 --port 5000
 python cli.py scan --host 192.168.1.100 --port 5000 --start 0 --end 15
 ```
 
-Scans device IDs 0–63 (or the specified range) in parallel and lists which
-devices are online together with their current side and lighting state.
+Scans device IDs 0–63 (or the specified range) **sequentially** over a
+single TCP connection.  Because the RS-485 bus is shared, only one device
+can be addressed at a time — sending multiple requests simultaneously would
+cause response collisions.  Each address is probed in order; unresponsive
+addresses are listed as OFFLINE after a configurable per-device timeout.
 
-Options: `--start N`, `--end N`, `--workers N`
+Options: `--start N`, `--end N`
 
 ### status — query device state
 

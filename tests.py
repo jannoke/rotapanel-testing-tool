@@ -7,6 +7,7 @@ TCP connection (sockets are mocked).
 
 from __future__ import annotations
 
+import pathlib
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -31,7 +32,7 @@ from rotapanel.protocol import (
 )
 from rotapanel.connection import RotapanelConnection, ConnectionError
 from rotapanel.device import RotapanelDevice
-from rotapanel.scanner import RotapanelScanner, ScanResult, _probe_device
+from rotapanel.scanner import RotapanelScanner, ScanResult, _probe_one
 from rotapanel.tests import RotapanelTester
 
 
@@ -391,13 +392,6 @@ class TestRotapanelDevice(unittest.TestCase):
 # ──────────────────────────────────────────────
 
 class TestRotapanelScanner(unittest.TestCase):
-    def _make_online_result(self, device_id: int) -> ScanResult:
-        return ScanResult(
-            device_id=device_id,
-            online=True,
-            side="A",
-            lighting_on=False,
-        )
 
     def test_online_devices_filter(self):
         results = [
@@ -421,36 +415,104 @@ class TestRotapanelScanner(unittest.TestCase):
         self.assertIn("OFFLINE", text)
         self.assertIn("timeout", text)
 
-    @patch("rotapanel.scanner._probe_device")
-    def test_scan_calls_probe_for_each_address(self, mock_probe):
-        mock_probe.return_value = ScanResult(device_id=0, online=False)
-        scanner = RotapanelScanner("127.0.0.1", 9999, workers=2)
-        results = scanner.scan(start=0, end=3)
-        self.assertEqual(len(results), 4)
-        self.assertEqual(mock_probe.call_count, 4)
+    @patch("rotapanel.scanner._probe_one")
+    @patch("rotapanel.scanner.RotapanelConnection")
+    def test_scan_probes_each_address_sequentially(self, mock_conn_cls, mock_probe):
+        """scan() calls _probe_one once per address, in order, using one connection."""
+        mock_conn = mock_conn_cls.return_value
+        mock_conn.is_connected = True
+        mock_probe.side_effect = lambda conn, addr: ScanResult(device_id=addr, online=False)
 
-    @patch("rotapanel.scanner._probe_device")
-    def test_is_alive_true(self, mock_probe):
+        scanner = RotapanelScanner("127.0.0.1", 9999)
+        results = scanner.scan(start=0, end=3)
+
+        # One connection opened and closed
+        mock_conn.connect.assert_called_once()
+        mock_conn.disconnect.assert_called_once()
+
+        # _probe_one called once per address with the same connection object
+        self.assertEqual(mock_probe.call_count, 4)
+        probed_ids = [call.args[1] for call in mock_probe.call_args_list]
+        self.assertEqual(probed_ids, [0, 1, 2, 3])
+        for call in mock_probe.call_args_list:
+            self.assertIs(call.args[0], mock_conn)
+
+    @patch("rotapanel.scanner._probe_one")
+    @patch("rotapanel.scanner.RotapanelConnection")
+    def test_scan_results_in_address_order(self, mock_conn_cls, mock_probe):
+        mock_conn = mock_conn_cls.return_value
+        mock_conn.is_connected = True
+        mock_probe.side_effect = lambda conn, addr: ScanResult(device_id=addr, online=False)
+
+        scanner = RotapanelScanner("127.0.0.1", 9999)
+        results = scanner.scan(start=0, end=4)
+        ids = [r.device_id for r in results]
+        self.assertEqual(ids, [0, 1, 2, 3, 4])
+
+    @patch("rotapanel.scanner.RotapanelConnection")
+    def test_scan_all_offline_if_cannot_connect(self, mock_conn_cls):
+        mock_conn = mock_conn_cls.return_value
+        mock_conn.connect.side_effect = ConnectionError("refused")
+
+        scanner = RotapanelScanner("127.0.0.1", 9999)
+        results = scanner.scan(start=0, end=2)
+
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(not r.online for r in results))
+
+    @patch("rotapanel.scanner._probe_one")
+    @patch("rotapanel.scanner.RotapanelConnection")
+    def test_scan_reconnects_after_connection_drop(self, mock_conn_cls, mock_probe):
+        """If is_connected becomes False mid-scan, reconnect and continue."""
+        mock_conn = mock_conn_cls.return_value
+
+        # After address 1 is probed, simulate a connection drop
+        call_count = [0]
+        def side_effect(conn, addr):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                mock_conn.is_connected = False  # simulate drop after addr 1
+            else:
+                mock_conn.is_connected = True
+            return ScanResult(device_id=addr, online=False, error_message="timeout")
+
+        mock_conn.is_connected = True
+        mock_probe.side_effect = side_effect
+
+        scanner = RotapanelScanner("127.0.0.1", 9999)
+        results = scanner.scan(start=0, end=3)
+
+        # Should have attempted reconnect
+        self.assertGreater(mock_conn.connect.call_count, 1)
+        self.assertEqual(len(results), 4)
+
+    @patch("rotapanel.scanner._probe_one")
+    @patch("rotapanel.scanner.RotapanelConnection")
+    def test_is_alive_true(self, mock_conn_cls, mock_probe):
+        mock_conn = mock_conn_cls.return_value
         mock_probe.return_value = ScanResult(device_id=1, online=True, side="A", lighting_on=False)
+
         scanner = RotapanelScanner("127.0.0.1", 9999)
         self.assertTrue(scanner.is_alive(1))
+        mock_conn.connect.assert_called_once()
+        mock_conn.disconnect.assert_called_once()
 
-    @patch("rotapanel.scanner._probe_device")
-    def test_is_alive_false(self, mock_probe):
+    @patch("rotapanel.scanner._probe_one")
+    @patch("rotapanel.scanner.RotapanelConnection")
+    def test_is_alive_false(self, mock_conn_cls, mock_probe):
+        mock_conn = mock_conn_cls.return_value
         mock_probe.return_value = ScanResult(device_id=2, online=False)
+
         scanner = RotapanelScanner("127.0.0.1", 9999)
         self.assertFalse(scanner.is_alive(2))
 
-    @patch("rotapanel.scanner._probe_device")
-    def test_scan_sorted_by_device_id(self, mock_probe):
-        # Return results in reverse order to test sorting
-        mock_probe.side_effect = lambda host, port, addr, timeout: ScanResult(
-            device_id=addr, online=False
-        )
-        scanner = RotapanelScanner("127.0.0.1", 9999, workers=4)
-        results = scanner.scan(start=0, end=4)
-        ids = [r.device_id for r in results]
-        self.assertEqual(ids, sorted(ids))
+    @patch("rotapanel.scanner.RotapanelConnection")
+    def test_is_alive_false_on_connection_error(self, mock_conn_cls):
+        mock_conn = mock_conn_cls.return_value
+        mock_conn.connect.side_effect = ConnectionError("refused")
+
+        scanner = RotapanelScanner("127.0.0.1", 9999)
+        self.assertFalse(scanner.is_alive(3))
 
 
 # ──────────────────────────────────────────────
@@ -537,6 +599,9 @@ class TestRotapanelTester(unittest.TestCase):
 # CLI (smoke test — no real network needed)
 # ──────────────────────────────────────────────
 
+_REPO_ROOT = pathlib.Path(__file__).parent
+
+
 class TestCLI(unittest.TestCase):
     def test_help_exits_cleanly(self):
         import subprocess, sys
@@ -544,7 +609,7 @@ class TestCLI(unittest.TestCase):
             [sys.executable, "cli.py", "--help"],
             capture_output=True,
             text=True,
-            cwd="/home/runner/work/rotapanel-testing-tool/rotapanel-testing-tool",
+            cwd=str(_REPO_ROOT),
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn("scan", result.stdout)
@@ -558,9 +623,10 @@ class TestCLI(unittest.TestCase):
             [sys.executable, "cli.py", "scan", "--help"],
             capture_output=True,
             text=True,
-            cwd="/home/runner/work/rotapanel-testing-tool/rotapanel-testing-tool",
+            cwd=str(_REPO_ROOT),
         )
         self.assertEqual(result.returncode, 0)
+        self.assertNotIn("--workers", result.stdout)
 
     def test_light_help(self):
         import subprocess, sys
@@ -568,7 +634,7 @@ class TestCLI(unittest.TestCase):
             [sys.executable, "cli.py", "light", "--help"],
             capture_output=True,
             text=True,
-            cwd="/home/runner/work/rotapanel-testing-tool/rotapanel-testing-tool",
+            cwd=str(_REPO_ROOT),
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn("--state", result.stdout)

@@ -151,12 +151,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=protocol.MAX_ADDR,
         help=f"Last address to scan (default: {protocol.MAX_ADDR})",
     )
-    scan_p.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="Parallel scan workers (default: 8)",
-    )
 
     # ── status ───────────────────────────────
     status_p = subs.add_parser("status", help="Query device status")
@@ -244,7 +238,6 @@ def cmd_scan(args: argparse.Namespace, host: str, port: int, timeout: float) -> 
         host=host,
         port=port,
         timeout=timeout,
-        workers=args.workers,
     )
     print(f"Scanning addresses {args.start}–{args.end} on {host}:{port} …")
     results = scanner.scan(start=args.start, end=args.end)
