@@ -21,6 +21,9 @@ DEFAULT_PORT: int = 5000
 DEFAULT_TIMEOUT: float = 2.0   # seconds per send/recv operation
 DEFAULT_RETRIES: int = 3
 INTER_RETRY_DELAY: float = 0.2  # seconds between retries
+# Short inter-read timeout used in Phase 2 of receive() to drain RS-485 echo
+# bytes without blocking for the full socket timeout when there is no echo.
+ECHO_DRAIN_TIMEOUT: float = 0.1
 
 
 class ConnectionError(OSError):
@@ -131,28 +134,60 @@ class RotapanelConnection:
             raise ConnectionError(f"Send failed: {exc}") from exc
 
     def receive(self, length: int = REPLY_LENGTH) -> bytes:
-        """Receive up to *length* bytes from the converter.
+        """Receive bytes from the converter.
+
+        When *length* equals ``REPLY_LENGTH``, reads exactly that many bytes
+        under the full socket timeout.
+
+        When *length* exceeds ``REPLY_LENGTH`` (e.g. ``RS485_BUFFER_SIZE`` for
+        RS-485 echo handling), the method uses a two-phase approach:
+
+        * **Phase 1** — read exactly ``REPLY_LENGTH`` bytes with the full
+          socket timeout, guaranteeing a baseline reply is received.
+        * **Phase 2** — attempt to drain any remaining bytes (echo data) using
+          a short ``ECHO_DRAIN_TIMEOUT`` inter-read timeout so we do *not*
+          block for the full socket timeout when the converter does not echo.
 
         Args:
-            length: Number of bytes to read.
+            length: Maximum number of bytes to read.
 
         Returns:
-            Raw bytes received from the device.
+            Raw bytes received from the device.  May be fewer than *length*
+            when no RS-485 echo is present.
 
         Raises:
-            ConnectionError: If not connected, a timeout occurs, or the
-                connection is closed by the remote end.
+            ConnectionError: If not connected, a timeout occurs before
+                receiving ``REPLY_LENGTH`` bytes, or the connection is closed
+                by the remote end.
         """
         if self._sock is None:
             raise ConnectionError("Not connected. Call connect() first.")
         try:
+            # Phase 1: read the minimum required bytes under the full timeout.
             data = b''
-            while len(data) < length:
-                chunk = self._sock.recv(length - len(data))
+            while len(data) < REPLY_LENGTH:
+                chunk = self._sock.recv(REPLY_LENGTH - len(data))
                 if not chunk:
                     self._sock = None
                     raise ConnectionError("Connection closed by remote host.")
                 data += chunk
+
+            # Phase 2: if a larger buffer was requested (RS-485 echo mode),
+            # collect any additional bytes with a short inter-read timeout so
+            # we don't block for the full socket timeout when there is no echo.
+            if length > REPLY_LENGTH:
+                self._sock.settimeout(ECHO_DRAIN_TIMEOUT)
+                try:
+                    while len(data) < length:
+                        chunk = self._sock.recv(length - len(data))
+                        if not chunk:
+                            break
+                        data += chunk
+                except socket.timeout:
+                    pass  # No more data available; return what we have.
+                finally:
+                    self._sock.settimeout(self.timeout)
+
             logger.debug("Received %d bytes: %s", len(data), data.hex())
             return data
         except socket.timeout as exc:

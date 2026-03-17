@@ -68,7 +68,7 @@ def _probe_one(conn: RotapanelConnection, device_id: int) -> ScanResult:
     try:
         frame = protocol.build_status_request(device_id)
         conn.send(frame)
-        raw = conn.receive(protocol.REPLY_LENGTH)
+        raw = conn.receive(protocol.RS485_BUFFER_SIZE)
         status = protocol.parse_reply(raw)
         return ScanResult(
             device_id=device_id,
