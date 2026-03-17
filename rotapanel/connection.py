@@ -146,10 +146,13 @@ class RotapanelConnection:
         if self._sock is None:
             raise ConnectionError("Not connected. Call connect() first.")
         try:
-            data = self._sock.recv(length)
-            if not data:
-                self._sock = None
-                raise ConnectionError("Connection closed by remote host.")
+            data = b''
+            while len(data) < length:
+                chunk = self._sock.recv(length - len(data))
+                if not chunk:
+                    self._sock = None
+                    raise ConnectionError("Connection closed by remote host.")
+                data += chunk
             logger.debug("Received %d bytes: %s", len(data), data.hex())
             return data
         except socket.timeout as exc:
