@@ -20,6 +20,7 @@ from rotapanel.protocol import (
     CMD_STATUS_ONLY,
     LIGHT_OFF,
     LIGHT_ON,
+    RS485_BUFFER_SIZE,
     DeviceStatus,
     ParseError,
     build_go,
@@ -212,6 +213,57 @@ class TestParseReply(unittest.TestCase):
         with self.assertRaises(ParseError):
             parse_reply(b"\xFF\xFF\xFF\xFF\xFF\xFF")
 
+    def test_parse_error_messages_include_hex(self):
+        # "too short" error should include a hex dump
+        try:
+            parse_reply(b"\x00\x52\x01")
+        except ParseError as exc:
+            self.assertIn("hex:", str(exc))
+
+        # "missing header" error should include a hex dump
+        try:
+            parse_reply(b"\xFF\xFF\xFF\xFF\xFF\xFF")
+        except ParseError as exc:
+            self.assertIn("ffffffffffff", str(exc))
+
+        # BCC mismatch error should include a hex dump
+        raw = _build_reply(0x01, 0x40)
+        corrupted = bytearray(raw)
+        corrupted[-2] ^= 0xFF
+        try:
+            parse_reply(bytes(corrupted))
+        except ParseError as exc:
+            self.assertIn("hex:", str(exc))
+
+    # ── RS-485 echo handling ──────────────────
+
+    def test_parse_reply_with_echo_prepended(self):
+        """parse_reply() should skip a command echo and find the reply frame."""
+        # Simulate: 6-byte command echo + 6-byte valid reply (12 bytes total)
+        command_echo = bytes([0x00, 0x23, 0x07, 0x54, 0x00, 0xA4])
+        reply = _build_reply(0x07, 0x40)
+        data = command_echo + reply
+        status = parse_reply(data)
+        self.assertEqual(status.address, 0x07)
+        self.assertEqual(status.side, "A")
+
+    def test_parse_reply_without_echo(self):
+        """parse_reply() should work normally with a plain 6-byte reply."""
+        raw = _build_reply(0x07, 0x40)
+        status = parse_reply(raw)
+        self.assertEqual(status.address, 0x07)
+        self.assertEqual(status.side, "A")
+
+    def test_parse_reply_with_partial_echo(self):
+        """parse_reply() should handle partial echo before the reply frame."""
+        # 2 echo bytes + 6-byte valid reply (8 bytes total)
+        partial_echo = bytes([0x00, 0x23])
+        reply = _build_reply(0x07, 0xC0)  # side C
+        data = partial_echo + reply
+        status = parse_reply(data)
+        self.assertEqual(status.address, 0x07)
+        self.assertEqual(status.side, "C")
+
 
 # ──────────────────────────────────────────────
 # DeviceStatus
@@ -294,6 +346,50 @@ class TestRotapanelConnection(unittest.TestCase):
         with RotapanelConnection("127.0.0.1", 9999, timeout=1.0, retries=1) as conn:
             self.assertTrue(conn.is_connected)
         self.assertFalse(conn.is_connected)
+
+    # ── RS-485 echo / two-phase receive ──────
+
+    @patch("rotapanel.connection.socket.socket")
+    def test_receive_rs485_echo_returns_combined_data(self, mock_socket_cls):
+        """Phase 1 gets REPLY_LENGTH bytes; Phase 2 gets echo bytes with short timeout."""
+        import socket as socket_module
+        from rotapanel.protocol import REPLY_LENGTH, RS485_BUFFER_SIZE
+
+        reply = _build_reply(0x07, 0x40)          # 6 bytes
+        command_echo = bytes([0x00, 0x23, 0x07, 0x54, 0x00, 0xA4])  # 6 bytes
+
+        mock_sock = mock_socket_cls.return_value
+        # Phase 1 recv returns 6 bytes; Phase 2 recv returns 6 echo bytes then times out
+        mock_sock.recv.side_effect = [reply, command_echo, socket_module.timeout]
+
+        conn = RotapanelConnection("127.0.0.1", 9999, timeout=1.0, retries=1)
+        conn.connect()
+        result = conn.receive(RS485_BUFFER_SIZE)
+
+        # Should have the reply plus the extra echo bytes
+        self.assertEqual(result[:6], reply)
+        self.assertEqual(result[6:], command_echo)
+        # settimeout was called to set the short Phase 2 timeout and restore it
+        mock_sock.settimeout.assert_called()
+
+    @patch("rotapanel.connection.socket.socket")
+    def test_receive_no_echo_returns_reply_only(self, mock_socket_cls):
+        """When no echo is present, Phase 2 times out and we return only the reply."""
+        import socket as socket_module
+        from rotapanel.protocol import REPLY_LENGTH, RS485_BUFFER_SIZE
+
+        reply = _build_reply(0x01, 0x80)  # 6 bytes, side B
+
+        mock_sock = mock_socket_cls.return_value
+        # Phase 1 returns 6 bytes; Phase 2 immediately times out (no echo)
+        mock_sock.recv.side_effect = [reply, socket_module.timeout]
+
+        conn = RotapanelConnection("127.0.0.1", 9999, timeout=1.0, retries=1)
+        conn.connect()
+        result = conn.receive(RS485_BUFFER_SIZE)
+
+        self.assertEqual(result, reply)
+        mock_sock.settimeout.assert_called()
 
 
 # ──────────────────────────────────────────────

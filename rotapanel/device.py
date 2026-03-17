@@ -15,6 +15,7 @@ from typing import Optional
 
 from rotapanel.connection import RotapanelConnection
 from rotapanel import protocol
+from rotapanel.protocol import RS485_BUFFER_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ class RotapanelDevice:
         """
         frame = protocol.build_status_request(self.device_id)
         logger.debug("[%02X] Sending status request", self.device_id)
-        raw = self.connection.send_and_receive(frame)
+        raw = self.connection.send_and_receive(frame, recv_length=RS485_BUFFER_SIZE)
         status = protocol.parse_reply(raw)
         logger.info("[%02X] Status: %s", self.device_id, status)
         return status
@@ -114,7 +115,7 @@ class RotapanelDevice:
         # Step 1 – TURN (prepare)
         turn_frame = protocol.build_turn(self.device_id, cmd_spec)
         logger.debug("[%02X] Sending TURN to side %s", self.device_id, side)
-        raw = self.connection.send_and_receive(turn_frame)
+        raw = self.connection.send_and_receive(turn_frame, recv_length=RS485_BUFFER_SIZE)
         status = protocol.parse_reply(raw)
         logger.info("[%02X] TURN reply: %s", self.device_id, status)
 
@@ -159,7 +160,7 @@ class RotapanelDevice:
         state = protocol.LIGHT_ON if on else protocol.LIGHT_OFF
         light_frame = protocol.build_light(self.device_id, state)
         logger.debug("[%02X] Sending LIGHT %s", self.device_id, "ON" if on else "OFF")
-        raw = self.connection.send_and_receive(light_frame)
+        raw = self.connection.send_and_receive(light_frame, recv_length=RS485_BUFFER_SIZE)
         status = protocol.parse_reply(raw)
         logger.info("[%02X] LIGHT reply: %s", self.device_id, status)
 

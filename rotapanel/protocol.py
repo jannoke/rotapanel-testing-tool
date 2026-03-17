@@ -74,6 +74,12 @@ LIGHT_ON: int = 0x01
 # Reply frame length (fill + 'R' + addr + status + BCC + EOT)
 REPLY_LENGTH: int = 6
 
+# Read buffer size for RS-485 converters that echo transmitted data back.
+# A typical transaction produces up to 12 bytes on the wire:
+#   6-byte command echo  +  6-byte device reply
+# 16 bytes provides a comfortable margin.
+RS485_BUFFER_SIZE: int = 16
+
 # Panel status masks / shifts
 _STATUS_SIDE_MASK: int = 0xC0  # bits 7 and 6
 _STATUS_LIGHT_BIT: int = 0x10  # bit 4
@@ -240,7 +246,8 @@ def parse_reply(data: bytes) -> DeviceStatus:
     """
     if len(data) < REPLY_LENGTH:
         raise ParseError(
-            f"Reply too short: expected {REPLY_LENGTH} bytes, got {len(data)}."
+            f"Reply too short: expected {REPLY_LENGTH} bytes, got {len(data)}"
+            f" (hex: {data.hex()})."
         )
 
     # Scan for the 0x00 'R' signature (device may prepend extra bytes)
@@ -265,7 +272,8 @@ def parse_reply(data: bytes) -> DeviceStatus:
     expected_bcc = _bcc(bytes([reply_ind, address, status]))
     if received_bcc != expected_bcc:
         raise ParseError(
-            f"BCC mismatch: expected 0x{expected_bcc:02X}, got 0x{received_bcc:02X}."
+            f"BCC mismatch: expected 0x{expected_bcc:02X}, got 0x{received_bcc:02X}"
+            f" (hex: {data.hex()})."
         )
 
     return DeviceStatus(address, status)
