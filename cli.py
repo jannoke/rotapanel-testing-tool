@@ -92,13 +92,52 @@ def _load_config(path: Optional[str]) -> dict:
 # ──────────────────────────────────────────────
 
 def _build_parser() -> argparse.ArgumentParser:
+    # Sub-parent parser: holds global options with SUPPRESS defaults so that
+    # subparsers do not overwrite values already captured by the main parser
+    # (e.g. --host supplied before the subcommand).
+    sub_parent = argparse.ArgumentParser(add_help=False)
+    sub_parent.add_argument(
+        "--host",
+        default=argparse.SUPPRESS,
+        help=f"RS485-to-TCP converter IP address (default: {DEFAULT_HOST})",
+    )
+    sub_parent.add_argument(
+        "--port",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=f"TCP port (default: {DEFAULT_PORT})",
+    )
+    sub_parent.add_argument(
+        "--timeout",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=f"Socket timeout in seconds (default: {DEFAULT_TIMEOUT})",
+    )
+    sub_parent.add_argument(
+        "--retries",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=f"Number of retries on failure (default: {DEFAULT_RETRIES})",
+    )
+    sub_parent.add_argument(
+        "--config",
+        default=argparse.SUPPRESS,
+        metavar="FILE",
+        help="Path to YAML configuration file",
+    )
+    sub_parent.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Enable debug logging",
+    )
+
+    # Main parser: global options added directly so proper defaults are set.
     parser = argparse.ArgumentParser(
         prog="rotapanel",
         description="Rotapanel RP-2000 testing and control tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-
-    # Global options
     parser.add_argument(
         "--host",
         default=None,
@@ -138,7 +177,8 @@ def _build_parser() -> argparse.ArgumentParser:
     subs.required = True
 
     # ── scan ─────────────────────────────────
-    scan_p = subs.add_parser("scan", help="Scan for live devices")
+    scan_p = subs.add_parser("scan", help="Scan for live devices",
+                             parents=[sub_parent])
     scan_p.add_argument(
         "--start",
         type=int,
@@ -153,7 +193,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # ── status ───────────────────────────────
-    status_p = subs.add_parser("status", help="Query device status")
+    status_p = subs.add_parser("status", help="Query device status",
+                               parents=[sub_parent])
     status_p.add_argument(
         "--device-id",
         type=int,
@@ -163,7 +204,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # ── control ──────────────────────────────
-    ctrl_p = subs.add_parser("control", help="Turn panel to a specific side")
+    ctrl_p = subs.add_parser("control", help="Turn panel to a specific side",
+                             parents=[sub_parent])
     ctrl_p.add_argument(
         "--device-id",
         type=int,
@@ -179,7 +221,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # ── light ────────────────────────────────
-    light_p = subs.add_parser("light", help="Control panel lighting")
+    light_p = subs.add_parser("light", help="Control panel lighting",
+                              parents=[sub_parent])
     light_p.add_argument(
         "--device-id",
         type=int,
@@ -195,7 +238,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # ── check-errors ─────────────────────────
-    err_p = subs.add_parser("check-errors", help="Check device for errors")
+    err_p = subs.add_parser("check-errors", help="Check device for errors",
+                            parents=[sub_parent])
     err_p.add_argument(
         "--device-id",
         type=int,
@@ -205,7 +249,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # ── test ─────────────────────────────────
-    test_p = subs.add_parser("test", help="Run automated test suite")
+    test_p = subs.add_parser("test", help="Run automated test suite",
+                             parents=[sub_parent])
     test_p.add_argument(
         "--device-id",
         type=int,
