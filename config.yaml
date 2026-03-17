@@ -1,0 +1,14 @@
+# Rotapanel testing tool — example configuration
+# Values in this file are used as defaults; CLI flags always override them.
+
+# RS485-to-TCP converter address
+host: "192.168.1.100"
+
+# TCP port on the converter
+port: 5000
+
+# Socket timeout in seconds (per send/receive operation)
+timeout: 2.0
+
+# Number of retries on communication failure
+retries: 3
