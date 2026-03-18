@@ -617,6 +617,50 @@ class TestRotapanelScanner(unittest.TestCase):
 
 class TestRotapanelTester(unittest.TestCase):
     def _make_tester(self, status_byte: int = 0x40):
+        """Return a tester backed by a smart mock that auto-updates the
+        reported side whenever a TURN command is issued.  This simulates
+        the panel completing a rotation instantly, which lets verification
+        polling pass on the first poll without any real time.sleep waits.
+
+        Non-side bits in *status_byte* (e.g. error flags) are preserved
+        across side changes so that error-condition tests still work.
+        """
+        conn = MagicMock(spec=RotapanelConnection)
+        conn.is_connected = True
+        conn.host = "127.0.0.1"
+        conn.port = 9999
+
+        # Mutable cell so the closure can update it
+        current_status = [status_byte]
+        error_bits = status_byte & 0x3F  # preserve all non-side bits
+
+        def auto_reply(frame, recv_length=None):
+            # frame layout: [0x00, '#', device_id, cmd_char, ...]
+            if len(frame) >= 5 and frame[3] == ord("T"):
+                cmd = frame[4]
+                if cmd == CMD_TURN_A:
+                    current_status[0] = error_bits | 0x40
+                elif cmd == CMD_TURN_B:
+                    current_status[0] = error_bits | 0x80
+                elif cmd == CMD_TURN_C:
+                    current_status[0] = error_bits | 0xC0
+            return _build_reply(0x01, current_status[0])
+
+        conn.send_and_receive.side_effect = auto_reply
+        tester = RotapanelTester(
+            device_id=1,
+            connection=conn,
+            step_delay=0,
+            light_delay=0,
+            turn_timeout=5.0,
+            status_poll_interval=0.0,
+        )
+        return tester
+
+    def _make_tester_fixed_side(self, status_byte: int = 0x40, turn_timeout: float = 5.0):
+        """Return a tester whose mock ALWAYS returns the same status byte,
+        ignoring turn commands.  Useful for testing timeout / abort logic
+        where the panel never actually changes side."""
         reply = _build_reply(0x01, status_byte)
         conn = MagicMock(spec=RotapanelConnection)
         conn.send_and_receive.return_value = reply
@@ -628,6 +672,8 @@ class TestRotapanelTester(unittest.TestCase):
             connection=conn,
             step_delay=0,
             light_delay=0,
+            turn_timeout=turn_timeout,
+            status_poll_interval=0.0,
         )
         return tester
 
@@ -689,6 +735,135 @@ class TestRotapanelTester(unittest.TestCase):
         report = tester.run_full_test()
         summary = report.summary()
         self.assertIn("FAIL", summary)
+
+    # ── new: turn_timeout / status_poll_interval params ──
+
+    def test_tester_stores_turn_timeout_and_poll_interval(self):
+        tester = self._make_tester(0x40)
+        self.assertEqual(tester.turn_timeout, 5.0)
+        self.assertEqual(tester.status_poll_interval, 0.0)
+
+    def test_custom_turn_timeout_param(self):
+        conn = MagicMock(spec=RotapanelConnection)
+        conn.host = "127.0.0.1"
+        conn.port = 9999
+        tester = RotapanelTester(
+            device_id=1,
+            connection=conn,
+            turn_timeout=42.0,
+            status_poll_interval=0.25,
+        )
+        self.assertEqual(tester.turn_timeout, 42.0)
+        self.assertEqual(tester.status_poll_interval, 0.25)
+
+    # ── new: test_turn_to_side_verified ──────
+
+    def test_turn_verified_passes_with_matching_side(self):
+        """Smart mock returns the correct side → verified immediately."""
+        tester = self._make_tester(0x40)
+        result = tester.test_turn_to_side_verified("B")
+        self.assertTrue(result.passed)
+        self.assertIn("verified side=B", result.detail)
+
+    def test_turn_verified_detail_all_sides(self):
+        """Verified detail is shown for all three sides."""
+        for side, side_byte in (("A", 0x40), ("B", 0x80), ("C", 0xC0)):
+            with self.subTest(side=side):
+                tester = self._make_tester(side_byte)
+                result = tester.test_turn_to_side_verified(side)
+                self.assertTrue(result.passed)
+                self.assertIn(f"verified side={side}", result.detail)
+
+    def test_turn_verified_timeout_when_side_never_changes(self):
+        """Fixed mock always returns side=A → turning to B times out."""
+        # turn_timeout=0.0 means the deadline is immediately expired
+        tester = self._make_tester_fixed_side(0x40, turn_timeout=0.0)
+        result = tester.test_turn_to_side_verified("B")
+        self.assertFalse(result.passed)
+        self.assertIn("TIMEOUT", result.detail)
+        self.assertIn("0.0s", result.detail)
+
+    def test_turn_verified_timeout_detail_shows_current_side(self):
+        """Timeout detail includes the side that was reported during polling."""
+        tester = self._make_tester_fixed_side(0x40, turn_timeout=0.0)
+        result = tester.test_turn_to_side_verified("C")
+        self.assertFalse(result.passed)
+        # Should mention that the panel remained at side A
+        self.assertIn("side remained A", result.detail)
+
+    def test_turn_verified_error_during_polling(self):
+        """If an error flag is set while waiting, the step fails immediately."""
+        # Fixed mock returns side=A with mechanical error bit set
+        tester = self._make_tester_fixed_side(0x40 | 0x02, turn_timeout=5.0)
+        result = tester.test_turn_to_side_verified("B")
+        self.assertFalse(result.passed)
+        self.assertIn("ERROR", result.detail)
+        self.assertIn("B", result.detail)
+
+    def test_turn_verified_connection_error(self):
+        """Exception from get_status is caught and reported as a failed step."""
+        conn = MagicMock(spec=RotapanelConnection)
+        conn.send_and_receive.side_effect = ConnectionError("dropped")
+        conn.host = "127.0.0.1"
+        conn.port = 9999
+        tester = RotapanelTester(
+            device_id=1,
+            connection=conn,
+            step_delay=0,
+            light_delay=0,
+            turn_timeout=5.0,
+            status_poll_interval=0.0,
+        )
+        result = tester.test_turn_to_side_verified("A")
+        self.assertFalse(result.passed)
+        self.assertIn("dropped", result.error)
+
+    # ── new: test_side_cycle abort logic ─────
+
+    def test_side_cycle_aborts_after_turn_failure(self):
+        """When turn B times out, turns C and A are marked SKIPPED."""
+        # Fixed mock always returns side=A; turn to A passes (side=A matches),
+        # but turn to B will time out because side never changes.
+        tester = self._make_tester_fixed_side(0x40, turn_timeout=0.0)
+        steps = tester.test_side_cycle()
+
+        self.assertEqual(len(steps), 4)
+        # Turn A passes (target side already matches)
+        self.assertTrue(steps[0].passed)
+        self.assertIn("verified side=A", steps[0].detail)
+        # Turn B times out
+        self.assertFalse(steps[1].passed)
+        self.assertIn("TIMEOUT", steps[1].detail)
+        # Turn C and final A are skipped
+        self.assertFalse(steps[2].passed)
+        self.assertIn("SKIPPED", steps[2].detail)
+        self.assertFalse(steps[3].passed)
+        self.assertIn("SKIPPED", steps[3].detail)
+
+    def test_side_cycle_aborts_after_error_between_turns(self):
+        """Errors detected after a successful turn abort the remaining turns."""
+        # Smart mock with error bits: every status response carries an error flag.
+        # Turn A will *pass* (side matches), but the post-turn error check will
+        # detect the error and abort turns B, C, and the return to A.
+        tester = self._make_tester(0x40 | 0x02)
+        steps = tester.test_side_cycle()
+
+        self.assertEqual(len(steps), 4)
+        # Turn A passes (side correctly reported as A after the TURN command)
+        self.assertTrue(steps[0].passed)
+        # Remaining turns skipped because of the post-turn error check
+        for step in steps[1:]:
+            self.assertFalse(step.passed)
+            self.assertIn("SKIPPED", step.detail)
+
+    def test_side_cycle_all_pass_with_smart_mock(self):
+        """With a smart mock (no errors) all four turns verify successfully."""
+        tester = self._make_tester(0x40)
+        steps = tester.test_side_cycle()
+        self.assertEqual(len(steps), 4)
+        for step in steps:
+            self.assertTrue(step.passed)
+            self.assertIn("verified side=", step.detail)
 
 
 # ──────────────────────────────────────────────

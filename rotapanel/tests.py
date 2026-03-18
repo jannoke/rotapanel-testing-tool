@@ -22,6 +22,12 @@ DEFAULT_STEP_DELAY: float = 1.0
 # Delay between light on/off during a light test (seconds)
 DEFAULT_LIGHT_DELAY: float = 0.5
 
+# Maximum seconds to wait for a turn to physically complete
+DEFAULT_TURN_TIMEOUT: float = 10.0
+
+# Seconds between status polls when waiting for a turn to complete
+DEFAULT_STATUS_POLL_INTERVAL: float = 0.5
+
 
 @dataclass
 class StepResult:
@@ -109,10 +115,14 @@ class RotapanelTester:
         connection: RotapanelConnection,
         step_delay: float = DEFAULT_STEP_DELAY,
         light_delay: float = DEFAULT_LIGHT_DELAY,
+        turn_timeout: float = DEFAULT_TURN_TIMEOUT,
+        status_poll_interval: float = DEFAULT_STATUS_POLL_INTERVAL,
     ) -> None:
         self.device = RotapanelDevice(device_id, connection)
         self.step_delay = step_delay
         self.light_delay = light_delay
+        self.turn_timeout = turn_timeout
+        self.status_poll_interval = status_poll_interval
 
     # ── individual tests ─────────────────────
 
@@ -180,17 +190,110 @@ class RotapanelTester:
                 error=str(exc),
             )
 
+    def _check_errors_step(self) -> StepResult:
+        """Check the device for active errors; helper used between turn steps."""
+        return self.test_error_check()
+
+    def test_turn_to_side_verified(self, side: str) -> StepResult:
+        """Send a TURN + GO command, then poll until the panel reaches *side*.
+
+        Polls :meth:`~rotapanel.device.RotapanelDevice.get_status` every
+        *status_poll_interval* seconds until either:
+
+        - The reported side matches *side*  → PASS (``"verified side=X"``), or
+        - An error flag is detected during polling → FAIL, or
+        - *turn_timeout* seconds elapse without a match → FAIL (``"TIMEOUT"``)
+
+        Args:
+            side: Target side – ``'A'``, ``'B'``, or ``'C'`` (case-insensitive).
+
+        Returns:
+            :class:`StepResult` with pass/fail status and detail message.
+        """
+        start = time.time()
+        target_side = side.upper()
+        name = f"Turn to side {target_side}"
+        try:
+            self.device.turn_to_side(side)
+            deadline = start + self.turn_timeout
+            while True:
+                status = self.device.get_status()
+                if status.side == target_side:
+                    return StepResult(
+                        name=name,
+                        passed=True,
+                        duration_s=time.time() - start,
+                        detail=f"verified side={status.side}",
+                    )
+                if status.has_any_error:
+                    errors = ", ".join(status.error_summary())
+                    return StepResult(
+                        name=name,
+                        passed=False,
+                        duration_s=time.time() - start,
+                        detail=f"ERROR while waiting for side {target_side}: {errors}",
+                    )
+                if time.time() >= deadline:
+                    return StepResult(
+                        name=name,
+                        passed=False,
+                        duration_s=time.time() - start,
+                        detail=(
+                            f"TIMEOUT: side remained {status.side} "
+                            f"after {self.turn_timeout:.1f}s"
+                        ),
+                    )
+                time.sleep(self.status_poll_interval)
+        except Exception as exc:
+            return StepResult(
+                name=name,
+                passed=False,
+                duration_s=time.time() - start,
+                error=str(exc),
+            )
+
     def test_side_cycle(self) -> List[StepResult]:
         """Cycle through all three sides: A → B → C → A.
+
+        Uses :meth:`test_turn_to_side_verified` for each turn so that the
+        panel's actual position is confirmed before the next step.  If any
+        turn fails (timeout, error, or exception) the remaining turns are
+        marked as *SKIPPED* to avoid cascading failures.  After each
+        successful turn the device is also checked for errors; further turns
+        are aborted if errors are detected.
 
         Returns:
             A list of four :class:`StepResult` objects.
         """
-        results = []
+        results: List[StepResult] = []
+        turn_failed = False
         for side in ("A", "B", "C", "A"):
-            result = self.test_turn_to_side(side)
+            if turn_failed:
+                results.append(
+                    StepResult(
+                        name=f"Turn to side {side}",
+                        passed=False,
+                        duration_s=0.0,
+                        detail="SKIPPED: previous turn failed",
+                    )
+                )
+                continue
+
+            result = self.test_turn_to_side_verified(side)
             results.append(result)
+
+            if not result.passed:
+                turn_failed = True
+                continue
+
+            # Check for errors after each successful turn; abort if found
+            error_step = self._check_errors_step()
+            if not error_step.passed:
+                turn_failed = True
+                continue
+
             time.sleep(self.step_delay)
+
         return results
 
     def test_light_on(self) -> StepResult:
